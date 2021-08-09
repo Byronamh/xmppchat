@@ -3,37 +3,60 @@ package main
 import (
 	"bufio"
 	"context"
-	"crypto/tls"
 	"encoding/xml"
-	"io"
+	"errors"
+	"fmt"
 	"log"
 	"os"
 	"strings"
+	"time"
 
-	"mellium.im/sasl"
-	"mellium.im/xmpp"
-	"mellium.im/xmlstream"
-	"mellium.im/xmpp/jid"
-	"mellium.im/xmpp/stanza"
+	"gosrc.io/xmpp"
+	"gosrc.io/xmpp/stanza"
 )
 
-type MessageBody struct {
-	stanza.Message
-	Body string `xml:"body"`
+const (
+	infoFormat       = "====== "
+	configContactSep = ";"
+)
+
+type appStateShape struct {
+	contacts       []string // Contacts list
+	currentContact string   // Contact we are currently messaging
+}
+
+var (
+	CorrespChan = make(chan string, 1)
+	textChan    = make(chan string, 5)
+	rawTextChan = make(chan string, 5)
+	killChan    = make(chan error, 1)
+	rosterChan  = make(chan struct{})
+
+	logger        *log.Logger
+	disconnectErr = errors.New("disconnecting client")
+	appState      = appStateShape{}
+
+	//set by user at start
+	username     = ""
+	password     = ""
+	serverDomain = ""
+)
+
+func buildMessage(message string, author string, channelName string) string {
+	return author + " -> " + channelName + " :" + message
 }
 
 func main() {
 
-	log.Println("Hello, please input your credentials")
 	reader := bufio.NewReader(os.Stdin)
 	log.Println("Enter your user: ")
-	var username, _ = reader.ReadString('\n')
+	username, _ = reader.ReadString('\n')
 	log.Println("---------------------")
 	log.Println("Enter your password: ")
-	var password, _ = reader.ReadString('\n')
+	password, _ = reader.ReadString('\n')
 	log.Println("---------------------")
-	log.Println("Enter the servers host: ")
-	var serverDomain, _ = reader.ReadString('\n')
+	log.Println("Enter the servers host: (use TLS port)")
+	serverDomain, _ = reader.ReadString('\n')
 	log.Println("---------------------")
 	log.Println("Attempting to contact host...")
 
@@ -41,71 +64,150 @@ func main() {
 	password = strings.TrimRight(password, "\r\n")
 	serverDomain = strings.TrimRight(serverDomain, "\r\n")
 
-	xmppAddrFormat := jid.MustParse(username)
-	session, err := xmpp.DialClientSession(
-		context.TODO(), xmppAddrFormat,
-		xmpp.BindResource(),
-		xmpp.StartTLS(&tls.Config{
-			ServerName: serverDomain,
-		}),
-		xmpp.SASL("", password, sasl.ScramSha1Plus, sasl.ScramSha1, sasl.Plain),
-	)
+	config := xmpp.Config{
+		TransportConfiguration: xmpp.TransportConfiguration{
+			Address: serverDomain,
+		},
+		Jid:        username,
+		Credential: xmpp.Password(password),
+		Insecure:   true,
+	}
+
+	router := xmpp.NewRouter()
+	router.HandleFunc("message", handleMessage)
+
+	client, err := xmpp.NewClient(&config, router, errorHandler)
 	if err != nil {
-		log.Printf("Error establishing a session: %q", err)
+		log.Panicln(fmt.Sprintf("Could not create client, reason: %s", err))
+	} else {
+		log.Println("Connection OK")
+	}
+
+	if err = client.Connect(); err != nil {
+		fmt.Println("Failed to connect to server. Exiting...")
 		return
 	}
 
-	// Exit and logout messages
-	defer func() {
-		log.Println("Closing session…")
-		if err := session.Close(); err != nil {
-			log.Printf("Error closing session: %q", err)
-		}
-		log.Println("Closing connection…")
-		if err := session.Conn().Close(); err != nil {
-			log.Printf("Error closing connection: %q", err)
-		}
-	}()
+	//first ation is getting the roster
+	getUserRoster(client)
 
-	// Send initial presence to let the server know we want to receive messages.
-	err = session.Send(context.TODO(), stanza.Presence{Type: stanza.AvailablePresence}.Wrap(nil))
-	if err != nil {
-		log.Printf("Error sending initial presence: %q", err)
-		return
+	// start channel router
+	go messageActionRouter(client)
+}
+
+func handleMessage(_ xmpp.Sender, pkg stanza.Packet) {
+	msg, ok := pkg.(stanza.Message)
+	if logger != nil {
+		m, _ := xml.Marshal(msg)
+		logger.Println(string(m))
 	}
 
-	session.Serve(xmpp.HandlerFunc(func(t xmlstream.TokenReadEncoder, start *xml.StartElement) error {
-		decoder := xml.NewTokenDecoder(t)
-
-		// Ignore anything that's not a message
-		if start.Name.Local != "message" {
-			return nil
-		}
-
-		msg := MessageBody{}
-		err = decoder.DecodeElement(&msg, start)
-		if err != nil && err != io.EOF {
-			log.Printf("Error decoding message: %q", err)
-			return nil
-		}
-
-		// Don't reflect messages unless they are chat messages and actually have a body
-		if msg.Body == "" || msg.Type != stanza.ChatMessage {
-			return nil
-		}
-
-		log.Printf("%q: %q", msg.Body, msg.From.Bare())
-		reply := MessageBody{
-			Message: stanza.Message{
-				To: msg.From.Bare(),
-			},
-			Body: msg.Body,
-		}
-		log.Printf("Replying to message %q from %s with body %q", msg.ID, reply.To, reply.Body)
-		err = t.Encode(reply)
+	if !ok {
+		fmt.Printf("%sIgnoring packet: %T\n", infoFormat, pkg)
+	}
+	if msg.Error.Code != 0 {
+		_, err := fmt.Printf("Error from server : %s : %s \n", msg.Error.Reason, msg.XMLName.Space)
 		if err != nil {
-			log.Printf("Error responding to message %q: %q", msg.ID, err)
+			fmt.Printf("Error happened: %s", err)
 		}
-		return nil
-	}))
+	}
+	if len(strings.TrimSpace(msg.Body)) != 0 {
+		_, err := fmt.Printf("%s : %s \n", msg.From, msg.Body)
+		if err != nil {
+			fmt.Printf("Error happened: %s", err)
+		}
+	}
+}
+
+func errorHandler(err error) {
+	killChan <- err
+}
+
+func messageActionRouter(client xmpp.Sender) {
+	var text string
+	var correspondent string
+	for {
+		select {
+		//on error or close req, close loop
+		case err := <-killChan:
+			if err == disconnectErr {
+				sc := client.(xmpp.StreamClient)
+				sc.Disconnect()
+			} else {
+				logger.Println(err)
+			}
+			return
+
+		//send message
+		case text = <-textChan:
+			reply := stanza.Message{Attrs: stanza.Attrs{To: correspondent, Type: stanza.MessageTypeChat}, Body: text}
+			if logger != nil {
+				raw, _ := xml.Marshal(reply)
+				logger.Println(string(raw))
+			}
+			err := client.Send(reply)
+			if err != nil {
+				fmt.Printf("There was a problem sending the message : %v", reply)
+				return
+			}
+
+		//raw message
+		case text = <-rawTextChan:
+			if logger != nil {
+				logger.Println(text)
+			}
+			err := client.SendRaw(text)
+			if err != nil {
+				fmt.Printf("There was a problem sending the message : %v", text)
+				return
+			}
+
+		//set corresponder from chanel
+		case crrsp := <-CorrespChan:
+			correspondent = crrsp
+
+		//get roster req
+		case <-rosterChan:
+			getUserRoster(client)
+		}
+
+	}
+}
+func getUserRoster(client xmpp.Sender) {
+	// Create request
+	req, _ := stanza.NewIQ(stanza.Attrs{From: username, Type: stanza.IQTypeGet})
+	req.RosterItems()
+
+	if logger != nil {
+		m, _ := xml.Marshal(req)
+		logger.Println(string(m))
+	}
+	ctx, _ := context.WithTimeout(context.Background(), 30*time.Second)
+
+	// Send request
+	c, err := client.SendIQ(ctx, req)
+	if err != nil {
+		logger.Panicln(err)
+	}
+
+	// spawn goroutine to update with srvr response to not block client
+	go func() {
+		serverResp := <-c
+		if logger != nil {
+			m, _ := xml.Marshal(serverResp)
+			logger.Println(string(m))
+		}
+
+		// Update contacts
+		if rosterItems, ok := serverResp.Payload.(*stanza.RosterItems); ok {
+			appState.contacts = []string{}
+			for _, item := range rosterItems.Items {
+				appState.contacts = append(appState.contacts, item.Jid)
+			}
+
+			fmt.Printf(infoFormat + "Contacts list updated !")
+			return
+		}
+		fmt.Printf(infoFormat + "Failed to update contact list !")
+	}()
 }
