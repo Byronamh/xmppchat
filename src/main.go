@@ -16,7 +16,7 @@ import (
 )
 
 const (
-	infoFormat       = "====== "
+	separator        = "\n= = = = = =\n"
 	configContactSep = ";"
 )
 
@@ -26,25 +26,19 @@ type appStateShape struct {
 }
 
 var (
-	CorrespChan = make(chan string, 1)
+	correspChan = make(chan string, 1)
 	textChan    = make(chan string, 5)
-	rawTextChan = make(chan string, 5)
 	killChan    = make(chan error, 1)
 	rosterChan  = make(chan struct{})
 
-	logger        *log.Logger
-	disconnectErr = errors.New("disconnecting client")
-	appState      = appStateShape{}
+	logger   *log.Logger
+	appState = appStateShape{}
 
 	//set by user at start
 	username     = ""
 	password     = ""
 	serverDomain = ""
 )
-
-func buildMessage(message string, author string, channelName string) string {
-	return author + " -> " + channelName + " :" + message
-}
 
 func main() {
 
@@ -80,11 +74,11 @@ func main() {
 	if err != nil {
 		log.Panicln(fmt.Sprintf("Could not create client, reason: %s", err))
 	} else {
-		log.Println("Connection OK")
+		log.Println("Client creation OK")
 	}
 
 	if err = client.Connect(); err != nil {
-		fmt.Println("Failed to connect to server. Exiting...")
+		log.Println("Failed to connect to server. Exiting...")
 		return
 	}
 
@@ -92,19 +86,21 @@ func main() {
 	getUserRoster(client)
 
 	// start channel router
-	go messageActionRouter(client)
+	go getUserAction()
+	initChannelActionManager(client)
 }
 
 func handleMessage(_ xmpp.Sender, pkg stanza.Packet) {
 	msg, ok := pkg.(stanza.Message)
 	if logger != nil {
 		m, _ := xml.Marshal(msg)
-		logger.Println(string(m))
+		logger.Println(string(m)) //output message to console
 	}
 
 	if !ok {
-		fmt.Printf("%sIgnoring packet: %T\n", infoFormat, pkg)
+		fmt.Printf("%sIgnoring packet: %T\n", separator, pkg)
 	}
+	//some messages can be errors too
 	if msg.Error.Code != 0 {
 		_, err := fmt.Printf("Error from server : %s : %s \n", msg.Error.Reason, msg.XMLName.Space)
 		if err != nil {
@@ -123,23 +119,24 @@ func errorHandler(err error) {
 	killChan <- err
 }
 
-func messageActionRouter(client xmpp.Sender) {
+func initChannelActionManager(client xmpp.Sender) {
 	var text string
 	var correspondent string
+	fmt.Printf("\nChannel action manager started\n")
+
 	for {
 		select {
 		//on error or close req, close loop
 		case err := <-killChan:
-			if err == disconnectErr {
-				sc := client.(xmpp.StreamClient)
-				sc.Disconnect()
-			} else {
-				logger.Println(err)
-			}
+			sc := client.(xmpp.StreamClient)
+			sc.Disconnect()
+			logger.Println(err)
 			return
 
 		//send message
 		case text = <-textChan:
+			log.Println(separator + "Got a message Request")
+
 			reply := stanza.Message{Attrs: stanza.Attrs{To: correspondent, Type: stanza.MessageTypeChat}, Body: text}
 			if logger != nil {
 				raw, _ := xml.Marshal(reply)
@@ -147,33 +144,31 @@ func messageActionRouter(client xmpp.Sender) {
 			}
 			err := client.Send(reply)
 			if err != nil {
-				fmt.Printf("There was a problem sending the message : %v", reply)
+				fmt.Printf("\nThere was a problem sending the message : %v\n", reply)
 				return
-			}
-
-		//raw message
-		case text = <-rawTextChan:
-			if logger != nil {
-				logger.Println(text)
-			}
-			err := client.SendRaw(text)
-			if err != nil {
-				fmt.Printf("There was a problem sending the message : %v", text)
-				return
+			}else{
+				log.Println("Message to "+correspondent+" has been sent")
 			}
 
 		//set corresponder from chanel
-		case crrsp := <-CorrespChan:
+		case crrsp := <-correspChan:
+			log.Println(separator + "Now sending messages to : " + crrsp + " in a private conversation")
+
 			correspondent = crrsp
 
 		//get roster req
 		case <-rosterChan:
+			log.Println( "Roster event recv." )
+
 			getUserRoster(client)
 		}
 
 	}
 }
 func getUserRoster(client xmpp.Sender) {
+
+	log.Println("Attempting to fetch user roster...")
+
 	// Create request
 	req, _ := stanza.NewIQ(stanza.Attrs{From: username, Type: stanza.IQTypeGet})
 	req.RosterItems()
@@ -189,25 +184,91 @@ func getUserRoster(client xmpp.Sender) {
 	if err != nil {
 		logger.Panicln(err)
 	}
+	fmt.Printf("Request for user roster sent")
 
-	// spawn goroutine to update with srvr response to not block client
-	go func() {
-		serverResp := <-c
-		if logger != nil {
-			m, _ := xml.Marshal(serverResp)
-			logger.Println(string(m))
+	serverResp := <-c
+	if logger != nil {
+		m, _ := xml.Marshal(serverResp)
+		logger.Println(string(m))
+	}
+
+	// Update contacts
+	if rosterItems, ok := serverResp.Payload.(*stanza.RosterItems); ok {
+		appState.contacts = []string{}
+		for _, item := range rosterItems.Items {
+			appState.contacts = append(appState.contacts, item.Jid)
 		}
 
-		// Update contacts
-		if rosterItems, ok := serverResp.Payload.(*stanza.RosterItems); ok {
-			appState.contacts = []string{}
-			for _, item := range rosterItems.Items {
-				appState.contacts = append(appState.contacts, item.Jid)
+		fmt.Printf(separator + "Contacts list updated !")
+		return
+	}
+	fmt.Printf(separator + "Failed to update contact list !")
+}
+
+func getUserAction() error {
+	reader := bufio.NewReader(os.Stdin)
+	printMenu()
+
+	for {
+		userOption, _ := reader.ReadString('\n')
+		userOption = strings.TrimRight(userOption, "\r\n")
+
+		switch userOption {
+		case "1":
+			printContactsToWindow()
+		case "2":
+			{
+				//send channel roster update request
+				log.Println(separator + "Asking server for contact list...")
+				rosterChan <- struct{}{}
 			}
+		case "3":
+			{
+				log.Println(separator + "What user do you want to message?")
 
-			fmt.Printf(infoFormat + "Contacts list updated !")
-			return
+				targetUser, _ := reader.ReadString('\n')
+				targetUser = strings.TrimRight(targetUser, "\r\n")
+				appState.currentContact = targetUser
+				correspChan <- targetUser // update correspondant
+			}
+		case "4":
+			{
+				log.Println("What do you want to say to " + appState.currentContact + "?")
+
+				outgoingMessage, _ := reader.ReadString('\n')
+				outgoingMessage = strings.TrimRight(outgoingMessage, "\r\n")
+
+				textChan <- outgoingMessage
+			}
+		case "5":
+			{
+				//send kill signal and output kill message, return gorutine
+				killChan <- errors.New("user disconect")
+				log.Println(separator + "You disconnected from the server.")
+				return nil
+			}
+		case "help":
+			printMenu()
 		}
-		fmt.Printf(infoFormat + "Failed to update contact list !")
-	}()
+	}
+}
+
+func printMenu() {
+	log.Println("1) View contacts")
+	log.Println("2) Refresh/Fetch contacts")
+	log.Println("3) Change current contact")
+	log.Println("4) Send a message to contact")
+	log.Println("5) Exit")
+	log.Println("'help') Print this menu")
+
+}
+func printContactsToWindow() {
+	for _, c := range appState.contacts {
+		c = strings.ReplaceAll(c, " *", "")
+		if c == appState.currentContact {
+			log.Println(c + "*\n")
+		} else {
+			log.Println(c + "\n")
+		}
+	}
 }
