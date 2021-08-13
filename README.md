@@ -1,6 +1,8 @@
 # xmppchat
 A CLI based chat client using xmpp as it's protocol written in Go
 
+To read my experience when developing this project, check out the [conclusions readme]("./conclusions.md")
+
 ## Installation
 
 You need to have [go](https://golang.org/dl/) installed
